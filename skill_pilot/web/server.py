@@ -11,6 +11,7 @@ import re
 import secrets
 import shutil
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -23,7 +24,7 @@ from pathlib import Path
 
 from ..scan import scan
 from ..store import apply, backups, guard, preview, restore, target_home
-from .. import operations, updates, cleanup, labels, tags, sharing, team, self_update, extra_sources, github_digest, normalization
+from .. import diagnostics, operations, updates, cleanup, labels, tags, sharing, team, self_update, extra_sources, github_digest, normalization
 from .. import agents as agent_management, agent_discovery
 from ..sources import github
 from . import runtime
@@ -124,6 +125,8 @@ class Dashboard(ThreadingHTTPServer):
         extra_sources.ensure(self.home)
         self.install_reviews = session.get('install_reviews', {})
         self.team_upload_reviews = session.get('team_upload_reviews', {})
+        self.feedback_previews = {}
+        self.feedback_lock = threading.Lock()
         self.jobs = []
         self.jobs_version = 0
         self.jobs_blocked = session.get('jobs_blocked', '')
@@ -160,6 +163,7 @@ class Dashboard(ThreadingHTTPServer):
         self.reload_callback = None
         self.reload_pending = False
         self.reload_error = ''
+        self.reload_error_id = ''
         self.reload_thread = None
         self.closing = False
         self.github_digests = github_digest.Digests(self.home, lambda: self.closing or self.reload_pending or
@@ -259,7 +263,7 @@ class Dashboard(ThreadingHTTPServer):
 
     def team_queue_status(self):
         fields = {'id', 'kind', 'key', 'name', 'title', 'repository', 'status', 'message', 'installed', 'reuse',
-                  'skipped', 'operation', 'tag', 'pack', 'pack_title'}
+                  'skipped', 'operation', 'tag', 'pack', 'pack_title', 'error_id'}
         with self.jobs_lock:
             return {'items': [copy.deepcopy({k: v for k, v in item.items() if k in fields})
                               for item in self.team_queue]}
@@ -530,18 +534,20 @@ class Dashboard(ThreadingHTTPServer):
                         item['operations'] += [r['id'] for r in getattr(error, 'operations', [])]
                         item['completed'] = sorted(set(item.get('completed', []) + getattr(error, 'completed', [])))
                         item['updated'] = item.get('_updated', []) + getattr(error, 'updated', [])
+                    item.update(diagnostics.failure(self.home, 'job', item['kind'], error))
                     self.stop_jobs()
                     result = None
                 except Exception as error:
                     result = {'status': 'failed', 'message': self.job_message(str(error))
                               if isinstance(error, ValueError) else '安装没能完成，请稍后重试。'
                               if item['kind'] in TEAM_JOBS else '任务没能完成，请重新核对后重试。'}
+                    result.update(diagnostics.failure(self.home, 'job', item['kind'], error))
                 finally:
                     self.invalidate_agents()
                     try:
                         self.inventory = scan(self.home)
-                    except (OSError, ValueError):
-                        pass  # Preserve the task's write result if a later scan fails.
+                    except (OSError, ValueError) as error:
+                        diagnostics.record(self.home, 'backend', '刷新技能名单', error)  # Preserve the task result.
                 if result is not None:
                     if item.get('_completed'):
                         result['completed'] = sorted(set(item['_completed'] + result.get('completed', [])))
@@ -624,6 +630,7 @@ class Dashboard(ThreadingHTTPServer):
                 except (ValueError, OSError) as error:
                     result = {'status': 'failed', 'message': str(error) if isinstance(error, ValueError)
                               else '文件没能读写，请核对后重试。'}
+                    result.update(diagnostics.failure(self.home, 'job', kind, error))
                 ids.extend(result.get('operations', []))
                 if result.get('status', 'done') == 'done':
                     completed.extend(group)
@@ -631,7 +638,8 @@ class Dashboard(ThreadingHTTPServer):
                 for name in group:
                     reason = '；'.join(c['message'] for c in result.get('conflicts', [])
                                       if c.get('skill', c.get('name')) == name) or result['message']
-                    failed.append({'name': name, 'error': self.job_message(self.skill_message(reason))})
+                    failed.append({'name': name, 'error': self.job_message(self.skill_message(reason)),
+                                   **({'error_id': result['error_id']} if result.get('error_id') else {})})
                 conflicts.extend(result.get('conflicts', []))
                 impacts.extend(result.get('new_impacts', []))
                 for key in preview:
@@ -710,7 +718,8 @@ class Dashboard(ThreadingHTTPServer):
                     raise
                 except (ValueError, OSError) as error:
                     reason = str(error) if isinstance(error, ValueError) else '文件没能读写，请重新检查更新后再试。'
-                    result = {'updated': [], 'failed': [{'name': n, 'error': reason} for n in remaining], 'operations': []}
+                    captured = diagnostics.failure(self.home, 'job', '更新技能', error)
+                    result = {'updated': [], 'failed': [{'name': n, 'error': reason, **captured} for n in remaining], 'operations': []}
                 failed = result.get('failed', []) + missing
                 ids = [r['id'] for r in result.get('operations', [])]
                 message = '已更新：' + ('、'.join(result['updated']) or '无') + '。'
@@ -719,7 +728,7 @@ class Dashboard(ThreadingHTTPServer):
                     message += ' 请重新检查更新后再试。'
                 return {'status': 'failed' if failed else 'done', 'message': self.job_message(self.skill_message(message)),
                         'updated': result['updated'], 'failed': [
-                            {'name': r['name'], 'error': self.job_message(self.skill_message(r['error']))} for r in failed],
+                            {'name': r['name'], 'error': self.job_message(self.skill_message(r['error'])), **({'error_id': r['error_id']} if r.get('error_id') else {})} for r in failed],
                         'operations': ids}
         elif kind in {'cleanup_withdraw', 'cleanup_delete'}:
             action = cleanup.delete_preview if kind == 'cleanup_delete' else cleanup.preview
@@ -817,7 +826,7 @@ class Dashboard(ThreadingHTTPServer):
             if action == 'apply' and (not self.program_review or target != self.program_review['target'] or
                                       not self.program_review['available']):
                 raise ValueError('请先检查 SP 更新，再升级。')
-            self.program_progress.update(running=True, phase=action, error='', automatic=automatic,
+            self.program_progress.update(running=True, phase=action, error='', error_id='', automatic=automatic,
                 message='正在下载并检查新版…' if action == 'check' else '正在升级，等当前操作完成…')
             self.program_thread = threading.Thread(target=self.program_work, args=(action, automatic), daemon=True)
             self.program_thread.start()
@@ -852,7 +861,9 @@ class Dashboard(ThreadingHTTPServer):
                 self.program_review['available'] = False
                 self.program_progress.update(result, phase='ready', message='新版已装好，刷新后生效')
         except Exception as error:
-            self_update.record_failure(self.home, action, error)
+            captured = self_update.record_failure(self.home, action, error) or {}
+            if captured:
+                self.program_progress['error_id'] = captured['error_id']
             if automatic:
                 self.program_progress.update(phase='idle', available=False, error='', message='还没查到新版信息')
             else:
@@ -870,11 +881,13 @@ class Dashboard(ThreadingHTTPServer):
             if not changed:
                 self.reload_pending = False
                 self.reload_error = ''
+                self.reload_error_id = ''
                 if self.program_progress['phase'] == 'ready':
                     self.program_progress.update(phase='latest', message='SP 已升级到最新版')
             if changed and self.reload_callback and not self.reload_pending:
                 self.reload_pending = True
                 self.reload_error = ''
+                self.reload_error_id = ''
                 self.reload_thread = threading.Thread(target=self.reload_when_idle, daemon=True)
                 self.reload_thread.start()
             return {'supported': bool(self.reload_callback), 'changed': changed,
@@ -890,6 +903,8 @@ class Dashboard(ThreadingHTTPServer):
                         self.reload_callback()
                     except Exception as error:
                         self.reload_error = str(error) if isinstance(error, ValueError) else '新版没能应用，当前程序保持运行，请稍后刷新重试。'
+                        captured = self_update.record_failure(self.home, 'apply', error) or {}
+                        self.reload_error_id = captured.get('error_id', '')
                     finally:
                         self.reload_pending = False
                     return
@@ -927,7 +942,7 @@ class Dashboard(ThreadingHTTPServer):
         with self.agents_lock:
             if self.agents_progress['running']:
                 return self.agents_progress.copy()
-            self.agents_progress.update(running=True, error='',
+            self.agents_progress.update(running=True, error='', error_id='',
                 message='正在扫描 agent…' if full else '正在检查新安装的 agent…')
             self.agents_thread = threading.Thread(target=self.scan_agents, args=(full,), daemon=True)
             self.agents_thread.start()
@@ -955,7 +970,8 @@ class Dashboard(ThreadingHTTPServer):
                 self.agents_generation += 1
                 self.agents_cache = None
                 self.agents_progress.update(checked_at=findings['checked_at'], message=message)
-        except (OSError, ValueError, KeyError, RuntimeError) as error:
+        except Exception as error:
+            self.agents_progress.update(diagnostics.failure(self.home, 'backend', '扫描 Agent', error))
             with self.agents_lock:
                 self.agents_progress.update(error=str(error) if isinstance(error, ValueError)
                     else 'agent 扫描没有完成，已保留上次名单，请重试。')
@@ -976,8 +992,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_one_request(self):
         self.counted_request = False
+        self.request_validation = False
         try:
             super().handle_one_request()
+        except Exception as error:
+            self.reply(500, {'error': '操作没有完成，可在设置中查看诊断记录。'})
         finally:
             if self.counted_request:
                 with self.server.runtime_lock:
@@ -1000,6 +1019,21 @@ class Handler(BaseHTTPRequestHandler):
         return secrets.compare_digest(token, self.server.token)
 
     def reply(self, status, body, content_type="application/json; charset=utf-8"):
+        error = sys.exception()
+        if isinstance(body, dict) and body.get('error') and status >= 400 and error is not None and not self.request_validation:
+            route = urllib.parse.urlsplit(self.path).path.split('/')
+            action = {'table': '读取技能名单', 'scan': '盘点技能', 'settings': '保存设置',
+                      'team': '团队商店', 'updates': '技能更新', 'jobs': '执行任务',
+                      'program': '程序升级', 'agents': '扫描 Agent', 'assignment': '分配技能',
+                      'migration': '整理技能', 'cleanup': '清理技能', 'install': '安装技能',
+                      'diagnostics': '生成诊断报告', 'log': '读取操作记录', 'backups': '读取备份'
+                      }.get(route[2] if len(route) > 2 else '', '处理看板操作')
+            captured = diagnostics.failure(self.server.home, 'backend', action, error)
+            if captured:
+                message = (diagnostics.sanitize(body['error'], self.server.home, 400)
+                           if isinstance(error, ValueError) and re.search(r'[\u4e00-\u9fff]', body['error'])
+                           else '操作没有完成，可在设置中查看诊断记录。')
+                body = {**body, **captured, 'error': message}
         if not isinstance(body, bytes):
             body = json.dumps(body, ensure_ascii=False).encode()
         self.send_response(status)
@@ -1021,7 +1055,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             self.reply(403, {"error": "此页面只允许本机本次打开的浏览器访问。"})
             return
-        if path == "/api/scan":
+        if path == '/api/diagnostics/errors':
+            rows = diagnostics.recent(self.server.home)
+            self.reply(200, [{k: v for k, v in row.items() if k != 'detail'} for row in rows])
+        elif path == "/api/scan":
             with self.server.inventory_lock:
                 if self.server.inventory.get('deferred'):
                     self.server.inventory = scan(self.server.home)
@@ -1080,7 +1117,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/status":
             self.reply(200, {"pid": os.getpid(), "read_only": not preview_allowed(self.server.home),
                              'version': self.server.code_version, 'reloading': self.server.reload_pending,
-                             'reload_error': self.server.reload_error})
+                             'reload_error': self.server.reload_error, 'error_id': self.server.reload_error_id})
         elif path in ("/api/migration/plan", "/api/backups", "/api/migration/compare"):
             try:
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -1104,7 +1141,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, {"comparison": "\n".join(texts)})
             except (ValueError, OSError, StopIteration) as error:
                 self.reply(409, {"error": str(error) or "这个技能已不在预览里，请重新预览。"})
-        elif path in ("/", "/app.js", "/app.css", "/favicon.svg",
+        elif path in ("/", "/app.js", "/diagnostics.js", "/app.css", "/favicon.svg",
                       "/vendor/gsap.min.js", "/vendor/ScrollTrigger.min.js"):
             file = STATIC / ("index.html" if path == "/" else path.removeprefix("/"))
             body = file.read_bytes().replace(b"__SESSION_TOKEN__", self.server.token.encode())
@@ -1118,6 +1155,57 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(403, {"error": "请求来源不属于本次看板。"})
             return
         path = urllib.parse.urlsplit(self.path).path
+        if path in {'/api/diagnostics/bundle', '/api/diagnostics/client-error',
+                    '/api/diagnostics/preview', '/api/diagnostics/submit'}:
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 16384:
+                    self.reply(413, {'error': '诊断内容太长，请缩短后重试。'})
+                    return
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict) or any(not isinstance(v, str) for v in body.values()):
+                    raise ValueError('诊断内容格式不正确。')
+                if path.endswith('/submit') and not preview_allowed(self.server.home):
+                    self.reply(403, {'error': '只读模式不能发送反馈，请复制或导出诊断信息。'})
+                    return
+                if path.endswith('/bundle'):
+                    self.reply(200, diagnostics.bundle(self.server.home, body.get('error_id'), body.get('note', '')))
+                elif path.endswith('/preview'):
+                    prepared = team.feedback_preview(self.server.home, body.get('error_id', ''), body.get('note', ''))
+                    ticket = secrets.token_urlsafe(24)
+                    with self.server.feedback_lock:
+                        self.server.feedback_previews = {k: v for k, v in self.server.feedback_previews.items()
+                                                        if v['expires'] > time.monotonic()}
+                        if len(self.server.feedback_previews) >= 100:
+                            self.server.feedback_previews.pop(next(iter(self.server.feedback_previews)))
+                        self.server.feedback_previews[ticket] = {'expires': time.monotonic() + 600, 'prepared': prepared}
+                    self.reply(200, {k: v for k, v in prepared.items() if k != '_connection'} | {'ticket': ticket})
+                elif path.endswith('/submit'):
+                    with self.server.feedback_lock:
+                        entry = self.server.feedback_previews.get(body.get('ticket'))
+                        if not entry or entry['expires'] <= time.monotonic():
+                            raise ValueError('预览已过期，请重新打开反馈窗口。')
+                        result = team.submit_feedback(self.server.home, entry['prepared'])
+                        del self.server.feedback_previews[body['ticket']]
+                    self.reply(200, result)
+                elif not preview_allowed(self.server.home):
+                    self.reply(403, {'error': '当前处于只读模式，错误记录未写入。'})
+                else:
+                    # A fixed action and a bounded message; never accept browser state or HTML.
+                    error = RuntimeError(body.get('message', '')[:4000])
+                    if body.get('error_type') in {'Error', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError'}:
+                        error.diagnostic_type = body['error_type']
+                    if re.fullmatch(r'(?:app|diagnostics)\.js:\d{1,6}:\d{1,6}', body.get('location', '')):
+                        error.diagnostic_location = body['location']
+                    row = diagnostics.record(self.server.home, 'frontend', '页面脚本',
+                        error, '页面出了点问题，请刷新重试。', force=True)
+                    self.reply(200, {'error_id': row.get('error_id', '')})
+            except (ValueError, OSError) as error:
+                message = (diagnostics.sanitize(str(error), self.server.home, 400)
+                           if path.endswith('/submit') else '诊断内容格式不正确，或记录已过期。')
+                self.request_validation = True
+                self.reply(400, {'error': message})
+            return
         if path in {'/api/heartbeat', '/api/runtime/refresh'}:
             # Consume small optional bodies before closing the HTTP/1.0
             # connection; unread request bytes can reset the reply on Windows.
@@ -1172,6 +1260,7 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(405, {"error": "当前阶段没有这个操作。"})
             return
         try:
+            self.request_validation = True
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 1024 * 1024:
@@ -1185,6 +1274,7 @@ class Handler(BaseHTTPRequestHandler):
                 if path == '/api/team/github/retry':
                     raise ValueError('请求内容格式不正确，请重新选择仓库后重试。') from None
                 raise
+            self.request_validation = False
             if path in job_routes:
                 if not preview_allowed(self.server.home):
                     self.reply(403, {'error': '当前处于只读模式，任务没有加入队列，文件没有改动。'})
