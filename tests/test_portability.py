@@ -148,19 +148,31 @@ class PortableInstallerTests(unittest.TestCase):
 
     def test_desktop_defaults_to_macos_url_opener_and_retains_diagnostics(self):
         self.assertEqual(self.install().returncode, 0)
-        self.cli.write_text('#!/bin/sh\nprintf "browser=%s\\n" "$BROWSER"\necho launcher-diagnostic >&2\n')
-        self.cli.chmod(0o755)
-        subprocess.run([str(self.app / 'Contents/MacOS/SkillPilot')], env=self.env,
-                       capture_output=True, check=True, timeout=5)
-        log = self.home / 'Library/Logs/SkillPilot-launcher.log'
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            text = log.read_text() if log.exists() else ''
-            if 'launcher-diagnostic' in text:
-                break
-            time.sleep(.02)
-        self.assertIn('browser=/usr/bin/open %s', text)
-        self.assertIn('launcher-diagnostic', text)
+        (self.code / 'skill_pilot/cli.py').write_text(
+            'import os, subprocess\nfrom pathlib import Path\n'
+            'def main():\n'
+            '    Path(os.environ["HOME"], "browser.txt").write_text(os.environ["BROWSER"])\n'
+            '    subprocess.run = lambda *args, **kwargs: None\n'
+            '    raise RuntimeError("launcher-diagnostic /outside/private file")\n')
+        log = self.home / '.skill-pilot/logs/errors.jsonl'
+        for count, extra in enumerate(({}, {'BROWSER': '/usr/bin/true'}), 1):
+            subprocess.run([str(self.app / 'Contents/MacOS/SkillPilot')], env={**self.env, **extra},
+                           capture_output=True, check=True, timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                rows = log.read_text().splitlines() if log.exists() else []
+                if len(rows) == count:
+                    break
+                time.sleep(.02)
+            self.assertEqual(len(rows), count)
+            row = json.loads(rows[-1])
+            self.assertEqual(row['source'], 'startup')
+            self.assertTrue(row['error_id'])
+            self.assertIn('launcher-diagnostic', row['detail'])
+            self.assertNotIn('private file', row['detail'])
+            self.assertEqual((self.home / 'browser.txt').read_text(), extra.get('BROWSER', '/usr/bin/open %s'))
+        self.assertFalse((self.home / 'Library/Logs/SkillPilot-launcher.log').exists())
+        self.assertFalse((self.code / 'launcher.log').exists())
 
     def test_desktop_entry_migration_and_source_update_refresh_without_reopening(self):
         result = self.install()
