@@ -723,11 +723,15 @@ class DigestRouteTests(unittest.TestCase):
             self.request('/api/team/catalog')
             # The catalog reply precedes startup, so wait until its handler starts the thread.
             for _ in range(100):
-                if self.server.github_digests.thread:
+                with self.server.github_digests.lock:
+                    thread = self.server.github_digests.thread
+                if thread is not None:
                     break
                 threading.Event().wait(.005)
-            self.server.github_digests.thread.join(timeout=3)
+            self.assertIsNotNone(thread)
+            thread.join(timeout=3)
             result = self.request('/api/team/github/digests')[1]['repos']['acme/example']
+            self.assertTrue(result.pop('error_id'))
             self.assertEqual(result, {'digest_status': 'failed', 'digest_error': labels.BUSY})
             status, result = self.request('/api/team/github/retry', {'repository': 'acme/example'})
             self.assertEqual(status, 200)

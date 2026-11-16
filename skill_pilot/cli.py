@@ -18,12 +18,14 @@ def main():
     inventory = commands.add_parser("scan", help="盘点本机 agent 和技能")
     inventory.add_argument("--json", action="store_true", help="输出完整机器可读结果")
     commands.add_parser("ui", help="打开中文看板").add_argument('--json', action='store_true')
+    commands.add_parser('doctor', help='只读查看脱敏环境与最近错误').add_argument('--json', action='store_true')
     hub = commands.add_parser('hub', help='运行团队分享站或管理成员')
     hub_commands = hub.add_subparsers(dest='hub_command', required=True)
     serving = hub_commands.add_parser('serve', help='启动分享站')
     serving.add_argument('--host', default='0.0.0.0', help='监听地址，默认局域网所有地址')
     serving.add_argument('--port', type=int, default=8765, help='监听端口，默认 8765')
     serving.add_argument('--open', action='store_true', help='开放加入：知道地址的同事填名字就能加入，不用口令')
+    serving.add_argument('--feedback-webhook', help='飞书多维表格自动化接收地址；也可设置 SKILL_PILOT_HUB_FEEDBACK_WEBHOOK')
     member = hub_commands.add_parser('add-member', help='添加成员并显示一次口令')
     member.add_argument('name', help='成员显示名')
     members = hub_commands.add_parser('members', help='查看成员名单，不显示口令')
@@ -143,6 +145,11 @@ def main():
     release.add_argument('--yes', action='store_true')
     release.add_argument('--json', action='store_true')
     args = parser.parse_args()
+    if args.command == 'doctor':
+        from .diagnostics import bundle
+        result = bundle()
+        print(result['text'] if args.json else '本机诊断（已脱敏）\n' + result['text'])
+        return
     if args.command == 'hub':
         from . import team_hub
         try:

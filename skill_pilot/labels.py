@@ -119,7 +119,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def completion(config, system, body, wait=None):
     if not config.get('api_key'):
-        raise ServiceError('请先到设置里填好 AI 服务的 key。')
+        raise ValueError('请先到设置里填好 AI 服务的 key。')
     wait = WAIT if wait is None else wait
     deadline = time.monotonic() + wait
     try:
@@ -164,8 +164,9 @@ def test(home):
         if not isinstance(result, dict) or result.get('ok') is not True:
             raise ServiceError(PARSE_ERROR)
         return {'ok': True, 'message': '连接成功，可以给技能起中文名了。'}
-    except ServiceError as error:
-        return {'ok': False, 'message': str(error)}
+    except ValueError as error:
+        from .diagnostics import failure
+        return {'ok': False, 'message': str(error), **failure(home, 'backend', '测试 AI 连接', error)}
 
 
 def run(home, mode, progress):
@@ -187,7 +188,7 @@ def run(home, mode, progress):
                     for n in names]
         skills = describe(sorted((n for n in registry if needs_work(have.get(n))), key=lambda n: (n in have, n)))
         scheduled = {s['name'] for s in skills}
-        progress.update(done=0, total=len(skills), message='正在整理技能的中文名和说明…', error='')
+        progress.update(done=0, total=len(skills), message='正在整理技能的中文名和说明…', error='', error_id='')
         def save():
             current = load(home)[1]['skills']
             for group in groups:
@@ -258,9 +259,11 @@ def run(home, mode, progress):
             progress.update(done=progress['done'] + len(accepted), message='正在整理技能的中文名和说明…')
         save()
         progress['message'] = f"已整理好 {progress['done']} 个技能" + ('，还有没整理成的，可以再试一次。' if progress['done'] < progress['total'] else '。')
-    except (ValueError, OSError, KeyError, TypeError) as error:
+    except Exception as error:
         # Only service errors are safe to expose; filesystem exceptions may include private data.
         progress['error'] = str(error) if isinstance(error, ServiceError) else '整理没能完成，请检查设置和技能文件后再试。'
+        from .diagnostics import failure
+        progress.update(failure(home, 'backend', '整理中文介绍', error, progress['error']))
         progress['message'] = progress['error']
     finally:
         progress['running'] = False
