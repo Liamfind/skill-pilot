@@ -447,6 +447,8 @@ def main():
                         raise ValueError('这个位置没有找到技能。')
                     names = args.skill or [s['name'] for s in review['skills']]
                     data = operations.install(review, names, args.agent, confirmed=args.yes)
+                    if review.get('notes'):
+                        data['reasons'] = review['notes'] + data.get('reasons', [])
                     if data.get('conflicts'):
                         from .web.server import compare_files
                         for conflict in data['conflicts']:

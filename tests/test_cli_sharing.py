@@ -184,6 +184,24 @@ class LocalInstallTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, message):
                 operations.inspect_local(folder, self.home)
 
+    def test_folder_in_an_app_managed_directory_is_copied_and_left_untouched(self):
+        bucket = self.home / '.claude/skills/synced/Example bucket'
+        synced = self.skill('.claude/skills/synced/Example bucket/chart-rules', 'chart-rules')
+        self.skill('.claude/skills/synced/Example bucket/writing-rules', 'writing-rules')
+        (synced / 'guide.md').write_text('示例资料\n')
+        before = store.physical_state(self.home / '.claude/skills/synced')
+        review = operations.inspect_local(synced, self.home)
+        self.assertIn('Claude', review['notes'][0])
+        result = operations.install(review, ['chart-rules'], ['codex'], home=self.home)
+        self.assertEqual(operations.load(self.home)[1]['skills']['chart-rules']['assigned_agents'], ['codex'])
+        self.assertEqual((self.home / '.codex/skills/chart-rules/guide.md').read_text(), '示例资料\n')
+        shown = run(self.home, 'install', str(bucket), '--skill', 'writing-rules', '--agent', 'claude')
+        self.assertEqual(shown.returncode, 2, shown.stdout + shown.stderr)
+        self.assertIn('原文件不动', shown.stdout)
+        self.assertIn('两份', shown.stdout)
+        operations.undo(result['id'], home=self.home)
+        self.assertEqual(store.physical_state(self.home / '.claude/skills/synced'), before)
+
     def test_command_line_preview_is_read_only(self):
         folder = self.skill('Drafts/new skill', 'new-skill')
         before = self.fingerprint()
